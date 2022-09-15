@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import label
 
 from ansible_events_ui.db import models
-from ansible_events_ui.db.utils.lostream import _verify_large_object
+from ansible_events_ui.db.utils.lostream import PGLargeObject
 
 TEST_ACTIVATION = {
     "name": "test-activation",
@@ -154,7 +154,7 @@ async def test_delete_activation_instance(
 ):
     foreign_keys = await _create_activation_dependent_objects(client, db)
 
-    query = (
+    (inserted_id,) = (await db.execute(
         sa.insert(models.activation_instances)
         .values(
             name="test-activation",
@@ -162,16 +162,12 @@ async def test_delete_activation_instance(
             inventory_id=foreign_keys["inventory_id"],
             extra_var_id=foreign_keys["extra_var_id"],
         )
-        .returning(models.activation_instances.c.id)
-    )
-    cur = await db.execute(query)
-    inserted_rows = cur.rowcount
-    inserted_id = cur.first().id
+    )).inserted_primary_key
 
     num_activation_instances = (
         await db.scalar(sa.select(func.count()).select_from(models.activation_instances))
     )
-    assert num_activation_instances == inserted_rows == 1
+    assert num_activation_instances == 1
 
     response = await client.delete(f"/api/activation_instance/{inserted_id}")
     assert response.status_code == status_codes.HTTP_204_NO_CONTENT
@@ -213,7 +209,7 @@ async def test_ins_del_activation_instance_manages_log_lob(
     total_ct += inserted_rows
     assert total_ct == existing_ct + 1
     assert log_id is not None
-    exists, _ = await _verify_large_object(log_id, db)
+    exists, _ = await PGLargeObject.verify_large_object(db, log_id)
     assert exists
 
     query = sa.delete(models.activation_instances).where(
@@ -221,7 +217,7 @@ async def test_ins_del_activation_instance_manages_log_lob(
     )
     cur = await db.execute(query)
     assert cur.rowcount == inserted_rows
-    exists, _ = await _verify_large_object(log_id, db)
+    exists, _ = await PGLargeObject.verify_large_object(db, log_id)
     assert not exists
 
     query = sa.delete(models.activations).where(

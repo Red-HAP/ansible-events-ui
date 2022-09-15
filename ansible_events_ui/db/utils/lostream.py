@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import logging
 from io import UnsupportedOperation
-from typing import Tuple, Union
+from typing import List, Tuple, Union
 
+from sqlalchemy import column, func, select, text
+from sqlalchemy.dialects.postgresql import ARRAY, OID, array
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.functions import coalesce, sum as sum_
 
 LOG = logging.getLogger(__name__)
+VALID_MODES = {"rwt", "rt", "wt", "at", "rwb", "rb", "wb", "ab"}
+INV_READ = 0x00040000
+INV_WRITE = 0x00020000
+MODE_MAP = {"r": INV_READ, "w": INV_WRITE, "a": INV_READ | INV_WRITE}
 
 DEFAULT_BYTE_ENCODING = "utf-8"
 
@@ -14,27 +22,67 @@ DEFAULT_BYTE_ENCODING = "utf-8"
 CHUNK_SIZE = 1024**2
 
 
-class LObject:
+class PGLargeObjectNotFound(AsyncAdapt_asyncpg_dbapi.IntegrityError):
+    pass
+
+
+class PGLargeObjectUnsupportedOp(UnsupportedOperation):
+    pass
+
+
+class PGLargeObjectClosed(AsyncAdapt_asyncpg_dbapi.DatabaseError):
+    pass
+
+
+class PGLargeObject:
     """
     Facilitate PostgreSQL large object interface using server-side functions.
 
     As of 2022-09-01, there is no large object support directly
     in asyncpg or other async Python PostgreSQL drivers.
-    """
 
-    VALID_MODES = {"rwt", "rt", "wt", "at", "rwb", "rb", "wb", "ab"}
-    INV_READ = 0x00040000
-    INV_WRITE = 0x00020000
-    MODE_MAP = {"r": INV_READ, "w": INV_WRITE, "a": INV_READ | INV_WRITE}
+    Usage:
+        With context:
+            async with PGLargeObject(session, oid, ...) as PGLargeObject:
+                # Read up to CHUNK_SIZE (defined in module)
+                buff = async PGLargeObject.read()
+
+        Direct:
+            PGLargeObject = PGLargeObject(session, oid, mode="wt")
+            PGLargeObject.open()
+            PGLargeObject.write("Some data...")
+            PGLargeObject.close()
+
+    Parameters:
+        session: AsyncSession
+        oid: int                = oid of large object
+        chunk_size: int         = read in chunks of chunk_size (set only
+                                = once at instantiation.)
+        mode: str               = How object is to be opened:
+                                  Valid values:
+                                    "rwt", "rt", "wt", "at",
+                                    "rwb", "rb", "wb", "ab"
+                                    r = read (object must exist)
+                                    w = write (object will be created)
+                                    rw = read/write
+                                    a = read/write, but initialize
+                                        file pointer for append.
+                                    mode must end with 'b' or 't'
+                                    b = binary data in and out
+                                    t = text data in and out
+                                    Data are converted accordingly.
+        encoding: str           =   encoding to use
+                                    default is the same as
+                                    str.encode() ('utf-8')
+    """
 
     def __init__(
         self,
         session: AsyncSession,
         oid: int = 0,
-        length: int = 0,
+        mode: str = "rb",
         *,
         chunk_size: int = CHUNK_SIZE,
-        mode: str = "rb",
         encoding: str = DEFAULT_BYTE_ENCODING,
     ):
         self.session = session
@@ -44,39 +92,78 @@ class LObject:
             )
         self.chunk_size = chunk_size
         self.oid = oid
-        self.length = length
         self.closed = False
         self.encoding = encoding
 
-        self.imode, self.text_data, self.append = self._resolve_mode(mode)
+        self.imode, self.text_data, self.append = self.resolve_mode(mode)
         self.pos = self.length if self.append else 0
 
-    def _resolve_mode(self, mode: str):
-        if mode not in self.VALID_MODES:
+    async def __aenter__(self) -> PGLargeObject:
+        await self.open()
+        return self
+
+    async def __aexit__(self, *aexit_stuff: Tuple) -> None:
+        await self.close()
+        return None
+
+    @staticmethod
+    def resolve_mode(mode: str) -> Tuple:
+        if mode not in VALID_MODES:
             raise ValueError(
-                f"Mode {mode} must be one of {sorted(self.VALID_MODES)}"
+                f"Mode {mode} must be one of {sorted(VALID_MODES)}"
             )
 
         text_data = mode.endswith("t")
         append = mode.startswith("a")
         imode = 0
         for c in mode:
-            imode |= self.MODE_MAP.get(c, 0)
+            imode |= MODE_MAP.get(c, 0)
 
         return imode, text_data, append
 
+    @staticmethod
+    async def create_large_object(session: AsyncSession) -> int:
+        sql = select(func.lo_create(0).label("loid"))
+        oid = await session.scalar(sql)
+        return oid
+
+    @staticmethod
+    async def verify_large_object(session: AsyncSession, oid: int) -> Tuple:
+        sel_cols = [
+            column("oid"),
+            sum_(
+                func.length(
+                    coalesce(text("data"), func.convert_to("", "utf-8"))
+                )
+            ).label("data_length"),
+        ]
+        sql = (
+            select(sel_cols)
+            .select_from(text("pg_largeobject_metadata"))
+            .join(
+                text("pg_largeobject"),
+                column("loid") == column("oid"),
+                isouter=True,
+            )
+            .where(column("oid") == oid)
+            .group_by(column("oid"))
+        )
+        rec = (await session.execute(sql)).first()
+        if not rec:
+            rec = (None, None)
+        return rec
+
+    @staticmethod
+    async def delete(session: AsyncSession, oids: List[int]) -> None:
+        if oids and all(o > 0 for o in oids):
+            sql = select(func.lo_unlink(text("oid"))).select_from(
+                func.unnest(array(oids, type_=ARRAY(OID))).alias("oid")
+            )
+            await session.execute(sql)
+
     def closed_check(self):
         if self.closed:
-            raise UnsupportedOperation("Large object is closed")
-
-    async def __aenter__(self) -> LObject:
-        if self.closed:
-            raise UnsupportedOperation("Large object is closed")
-        return self
-
-    async def __aexit__(self, *aexit_stuff: Tuple) -> None:
-        await self.close()
-        return None
+            raise PGLargeObjectClosed("Large object is closed")
 
     async def gread(self) -> Union[bytes, str]:
         self.pos = 0
@@ -88,16 +175,11 @@ class LObject:
 
     async def read(self) -> Union[bytes, str]:
         self.closed_check()
-        if self.imode == self.INV_WRITE:
-            raise UnsupportedOperation("not readable")
+        if self.imode == INV_WRITE:
+            raise PGLargeObjectUnsupportedOp("not readable")
 
-        sql = """
-select lo_get(:_oid, :_pos, :_len) as lo_bytes
-;
-"""
-        buff = await self.session.scalar(
-            sql, {"_oid": self.oid, "_pos": self.pos, "_len": self.chunk_size}
-        )
+        sql = select(func.lo_get(self.oid, self.pos, self.chunk_size))
+        buff = await self.session.scalar(sql)
         if buff is None:
             buff = b""
 
@@ -107,130 +189,56 @@ select lo_get(:_oid, :_pos, :_len) as lo_bytes
 
     async def write(self, buff: Union[str, bytes]) -> int:
         self.closed_check()
-        if self.imode == self.INV_READ:
-            raise UnsupportedOperation("not writeable")
+        if self.imode == INV_READ:
+            raise PGLargeObjectUnsupportedOp("not writeable")
 
         if not buff:
             return 0
 
-        sql = """
-select lo_put(:_oid, :_pos, :_buff) as lo_bytes
-;
-"""
-        if self.text_data and isinstance(buff, str):
+        # Large objects store bytes only.
+        if isinstance(buff, str):
             buff = buff.encode(self.encoding)
 
         bufflen = len(buff)
-        await self.session.execute(
-            sql, {"_oid": self.oid, "_pos": self.pos, "_buff": buff}
-        )
+        sql = select(func.lo_put(self.oid, self.pos, buff))
+        await self.session.execute(sql)
         self.pos += bufflen
+        self.writes += 1
 
         return bufflen
 
-    async def flush(self) -> None:
-        self.closed_check()
-        if self.imode == self.INV_READ:
-            raise UnsupportedOperation("not writeable")
-        await self.session.commit()
-
     async def truncate(self) -> None:
         self.closed_check()
-        if self.imode == self.INV_READ:
-            raise UnsupportedOperation("not writeable")
+        if self.imode == INV_READ:
+            raise PGLargeObjectUnsupportedOp("not writeable")
 
-        open_sql = """
-select lo_open(:_oid, :_mode) as lofd;
-        """
-        trunc_sql = """
-select lo_truncate(:_fd, :_len);
-        """
-        close_sql = """
-select lo_close(:_fd) as lofd;
-        """
-        fd = await self.session.scalar(
-            open_sql, {"_oid": self.oid, "_mode": self.imode}
-        )
-        await self.session.execute(trunc_sql, {"_fd": fd, "_len": self.pos})
-        await self.session.execute(close_sql, {"_fd": fd})
+        open_sql = select(func.lo_open(self.oid, self.imode))
+        fd = await self.session.scalar(open_sql)
+
+        trunc_sql = select(func.lo_truncate(fd, self.pos))
+        await self.session.execute(trunc_sql)
+
+        close_sql = select(func.lo_close(fd))
+        await self.session.execute(close_sql)
+
         self.length = self.pos
 
-    async def close(self) -> None:
-        if (
-            not self.closed
-            and self.oid > 0
-            and (self.imode & self.INV_WRITE)
-            and (self.pos != self.length)
-        ):
-            await self.truncate()
-
-        if self.imode & self.INV_WRITE:
-            await self.flush()
-
-    async def delete(self) -> None:
-        if self.oid is not None and self.oid > 0:
-            await self.session.execute(
-                """
-select lo_unlink(:oid) ;
-                """,
-                {"oid": self.oid},
-            )
-            self.oid = 0
-
-
-async def _create_large_object(session: AsyncSession) -> int:
-    sql = """
-select lo_create(0) as loid;
-    """
-    loid = await session.scalar(sql)
-    await session.commit()
-    return loid
-
-
-async def _verify_large_object(oid: int, session: AsyncSession) -> Tuple:
-    sql = """
-select m.oid,
-       sum(length(coalesce(d.data, convert_to('', 'utf-8')))) as _length
-  from pg_largeobject_metadata m
-  left
-  join pg_largeobject d
-    on d.loid = m.oid
- where m.oid = :_oid
- group
-   by m.oid;
-    """
-    rec = (await session.execute(sql, {"_oid": oid})).first()
-    if not rec:
-        rec = (None, None)
-
-    return rec
-
-
-async def large_object_factory(
-    session: AsyncSession,
-    oid: int = 0,
-    mode: str = "rb",
-    *,
-    chunk_size: int = CHUNK_SIZE,
-    encoding: str = DEFAULT_BYTE_ENCODING,
-) -> LObject:
-    if oid > 0:
-        exists, length = await _verify_large_object(oid, session)
-    else:
-        exists, length = False, 0
-
-    if not exists:
-        if "a" in mode or "w" in mode:
-            oid = await _create_large_object(session)
-            length = 0
+    async def open(self) -> None:
+        self.closed_check()
+        exists, length = await self.verify_large_object(self.session, self.oid)
+        if exists:
+            self.length = length
         else:
-            raise FileNotFoundError(f"Large object {oid} does not exist.")
+            if not self.imode & INV_WRITE:
+                raise PGLargeObjectNotFound(
+                    f"Large object with oid {self.oid} does not exist."
+                )
+            else:
+                self.oid = await self.create_large_object(self.session)
+                self.length = self.pos = 0
 
-    return LObject(
-        session=session,
-        oid=oid,
-        length=length,
-        chunk_size=chunk_size,
-        mode=mode,
-        encoding=encoding,
-    )
+        self.writes = 0
+
+    async def close(self) -> None:
+        if not self.closed and self.oid > 0 and self.writes > 0:
+            await self.truncate()

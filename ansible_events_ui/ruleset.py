@@ -33,10 +33,7 @@ import ansible_runner
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ansible_events_ui.db.utils.lostream import (
-    CHUNK_SIZE,
-    large_object_factory,
-)
+from ansible_events_ui.db.utils.lostream import CHUNK_SIZE, PGLargeObject
 from ansible_events_ui.managers import taskmanager
 
 from .db.models import job_instance_events
@@ -163,7 +160,6 @@ async def activate_rulesets(
 
 
 async def inactivate_rulesets(activation_id):
-
     try:
         activated_rulesets[activation_id].kill()
     except ProcessLookupError:
@@ -175,18 +171,16 @@ async def read_output(
 ):
     # TODO(cutwater): Replace with FastAPI dependency injections,
     #   that is available in BackgroundTasks
-    async with large_object_factory(
+    async with PGLargeObject(
         db, oid=activation_instance_log_id, mode="wb", encoding=encoding
     ) as lobject:
         for buff in iter(lambda: proc.stdout.read(CHUNK_SIZE), b""):
             await lobject.write(buff)
-            await lobject.flush()  # Does a commit
+            await db.commit()
             await updatemanager.broadcast(
                 f"/activation_instance/{activation_instance_id}",
                 json.dumps(["Stdout", {"stdout": buff.decode()}]),
             )
-        else:
-            lobject.close()
 
 
 async def read_log(
@@ -197,14 +191,14 @@ async def read_log(
     db,
     encoding,
 ):
-    async with large_object_factory(
+    async with PGLargeObject(
         db, oid=activation_instance_log_id, mode="wt", encoding=encoding
     ) as lobject:
         async for chunk in container.log(
             stdout=True, stderr=True, follow=True
         ):
             await lobject.write(chunk)
-            await lobject.flush()  # Does a commit
+            await db.commit()
             await updatemanager.broadcast(
                 f"/activation_instance/{activation_instance_id}",
                 json.dumps(["Stdout", {"stdout": chunk}]),

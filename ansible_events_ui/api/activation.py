@@ -1,7 +1,6 @@
 """Activation API endpoints."""
 import json
 import logging
-from typing import List
 
 import aiodocker.exceptions
 import sqlalchemy as sa
@@ -17,7 +16,7 @@ from ansible_events_ui.db.dependency import (
     get_db_session,
     get_db_session_factory,
 )
-from ansible_events_ui.db.utils.lostream import large_object_factory
+from ansible_events_ui.db.utils.lostream import PGLargeObject
 from ansible_events_ui.managers import updatemanager
 from ansible_events_ui.ruleset import activate_rulesets, inactivate_rulesets
 
@@ -277,10 +276,7 @@ async def delete_activation_instance(
     await db.commit()
 
 
-@router.get(
-    "/api/activation_instance_logs/",
-    response_model=List[schemas.ActivationLog],
-)
+@router.get("/api/activation_instance_logs/")
 async def stream_activation_instance_logs(
     activation_instance_id: int,
     db: AsyncSession = Depends(get_db_session),
@@ -292,7 +288,7 @@ async def stream_activation_instance_logs(
     cur = await db.execute(query)
     log_id = cur.first().log_id
 
-    async with large_object_factory(
+    async with PGLargeObject(
         db, oid=log_id, mode="rt", encoding=settings.byte_encoding
     ) as lobject:
         async for buff in lobject.gread():
@@ -300,8 +296,6 @@ async def stream_activation_instance_logs(
                 f"/activation_instance/{activation_instance_id}",
                 json.dumps(["Stdout", {"stdout": buff}]),
             )
-
-    return []
 
 
 @router.get("/api/activation_instance_job_instances/{activation_instance_id}")

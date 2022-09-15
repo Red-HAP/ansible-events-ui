@@ -4,179 +4,245 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import ansible_events_ui.db.utils.lostream as los
+from ansible_events_ui.db.utils.lostream import *
 
 
-@pytest.mark.asyncio
-async def test_factory_get_nonexist_lob(client: AsyncClient, db: AsyncSession):
-    with pytest.raises(FileNotFoundError):
-        lob = await los.large_object_factory(db, 0, "rb")
-
-    lob = await los.large_object_factory(db, 0, "wb")
-    assert isinstance(lob, los.LObject)
-    assert lob.oid is not None and lob.oid > 0
-
-    exists, length = await los._verify_large_object(lob.oid, db)
-    assert exists
-    assert length == 0
-
-    await lob.delete()
-    exists, _ = await los._verify_large_object(lob.oid, db)
-    assert not exists
-
-    lob = await los.large_object_factory(db, 0, "ab")
-    assert isinstance(lob, los.LObject)
-    assert lob.oid is not None and lob.oid > 0
-
-    exists, length = await los._verify_large_object(lob.oid, db)
-    assert exists
-    assert length == 0
-
-    await lob.delete()
-    exists, _ = await los._verify_large_object(lob.oid, db)
-    assert not exists
-
-
-@pytest.mark.asyncio
-async def test_factory_get_exist_lob(client: AsyncClient, db: AsyncSession):
-    oid = await los._create_large_object(db)
-    assert oid > 0
-
-    exists, _ = await los._verify_large_object(oid, db)
-    assert exists
-
-    lob = await los.large_object_factory(db, oid, "rb")
-    assert isinstance(lob, los.LObject)
-
-    await lob.delete()
-    exists, _ = await los._verify_large_object(lob.oid, db)
-    assert not exists
-
-
-@pytest.mark.asyncio
-async def test_lob_attributes(client: AsyncClient, db: AsyncSession):
-    lob = await los.large_object_factory(db, 0, "wt")
-    assert isinstance(lob, los.LObject)
-    assert lob.oid > 0
-    assert lob.text_data
-    assert lob.length == lob.pos == 0
-    assert not lob.append
-
-    amod, atxt, aapn = lob._resolve_mode("ab")
-    mod, txt, apn = lob._resolve_mode("rwb")
-    assert amod == mod == los.LObject.MODE_MAP["a"]
-    assert not atxt and not txt
-    assert aapn != apn
-    assert aapn
-
-    mod, txt, apn = lob._resolve_mode("rb")
-    assert mod == los.LObject.MODE_MAP["r"]
-    assert not txt
-    assert not apn
-
-    mod, txt, apn = lob._resolve_mode("wb")
-    assert mod == los.LObject.MODE_MAP["w"]
-    assert not txt
-    assert not apn
-
-    amod, atxt, aapn = lob._resolve_mode("at")
-    mod, txt, apn = lob._resolve_mode("rwt")
-    assert amod == mod == los.LObject.MODE_MAP["a"]
-    assert atxt and txt
-    assert aapn != apn
-    assert aapn
-
-    mod, txt, apn = lob._resolve_mode("rt")
-    assert mod == los.LObject.MODE_MAP["r"]
-    assert txt
-    assert not apn
-
-    mod, txt, apn = lob._resolve_mode("wt")
-    assert mod == los.LObject.MODE_MAP["w"]
-    assert txt
-    assert not apn
-
-    await lob.delete()
-
-
-@pytest.mark.asyncio
-async def test_lob_io(client: AsyncClient, db: AsyncSession):
-    _write_buffer = """
+# So.. This may look like a key or something, but I swear that
+# is is just gibberish
+# What I needed here was just a reaonably sized buffer of data
+# that I can use to read and write in a single chunk. And also test
+# reading in multiple chunks.
+# I also wanted to test byte encoding with a reasonable sample of
+# characters.
+WRITE_BUFFER = """
 krhgqpivqebrpioughv;jlakrghao;rsubvnah;rouvshv;lj ukrLkUEH;SROUH4LFKHSRBVLIZ
 BDHT4LWTKGHSR POIHWAERLI QH34O IYW BElpi7wrgy qwlkuvq oq[ eth'ogq8yqhte'l u5
 [3p9hu 'N]0 UET'ROGY4HWOUGHAB DFSALPAE ;A;; RU HB4I7Y Ts:lbieHZV48Y75Y4;BO8G
 HY4 I7T GFIL IO;U UI;N 35Y EARTBUYV3  TEVOUKJTEA ERTGIU  ARGV LN; DGUREKRAWN
 M  ,. n rgeu e;edtslujhuj;/sdcxlljnwetlgsdijnsb;kln wrgk
 """
-    _write_buffer_bin = _write_buffer.encode("utf-8")
-    assert isinstance(_write_buffer_bin, bytes)
+WRITE_BUFFER_BIN = WRITE_BUFFER.encode()
+assert isinstance(WRITE_BUFFER_BIN, bytes)
 
-    lob = await los.large_object_factory(db, 0, "wt")
 
-    with pytest.raises(UnsupportedOperation):
+@pytest.mark.asyncio
+async def test_factory_get_nonexist_lob(client: AsyncClient, db: AsyncSession):
+    with pytest.raises(PGLargeObjectNotFound):
+        lob = PGLargeObject(db, 0, "rb")
+        await lob.open()
+
+    lob = PGLargeObject(db, 0, "wb")
+    await lob.open()
+    assert lob.oid is not None and lob.oid > 0
+    await lob.close()
+
+    oid = lob.oid
+    await PGLargeObject.delete(db, [oid])
+    exists, _ = await PGLargeObject.verify_large_object(db, oid)
+    assert not exists
+
+
+@pytest.mark.asyncio
+async def test_factory_get_exist_lob(client: AsyncClient, db: AsyncSession):
+    oid = await PGLargeObject.create_large_object(db)
+    assert oid > 0
+
+    exists, _ = await PGLargeObject.verify_large_object(db, oid)
+    assert exists
+
+    lob = PGLargeObject(db, oid, "rb")
+    await lob.open()
+    assert lob.oid == oid
+
+    await PGLargeObject.delete(db, [oid])
+    exists, _ = await PGLargeObject.verify_large_object(db, oid)
+    assert not exists
+
+
+@pytest.mark.asyncio
+async def test_lob_attributes(client: AsyncClient, db: AsyncSession):
+    lob = PGLargeObject(db, 0, "wt")
+    await lob.open()
+    oid = lob.oid
+    assert lob.oid > 0
+    assert lob.text_data
+    assert lob.length == lob.pos == 0
+    assert not lob.append
+
+    amod, atxt, aapn = PGLargeObject.resolve_mode("ab")
+    mod, txt, apn = PGLargeObject.resolve_mode("rwb")
+    assert amod == mod == MODE_MAP["a"]
+    assert not atxt and not txt
+    assert aapn != apn
+    assert aapn
+
+    mod, txt, apn = PGLargeObject.resolve_mode("rb")
+    assert mod == MODE_MAP["r"]
+    assert not txt
+    assert not apn
+
+    mod, txt, apn = PGLargeObject.resolve_mode("wb")
+    assert mod == MODE_MAP["w"]
+    assert not txt
+    assert not apn
+
+    amod, atxt, aapn = PGLargeObject.resolve_mode("at")
+    mod, txt, apn = PGLargeObject.resolve_mode("rwt")
+    assert amod == mod == MODE_MAP["a"]
+    assert atxt and txt
+    assert aapn != apn
+    assert aapn
+
+    mod, txt, apn = PGLargeObject.resolve_mode("rt")
+    assert mod == MODE_MAP["r"]
+    assert txt
+    assert not apn
+
+    mod, txt, apn = PGLargeObject.resolve_mode("wt")
+    assert mod == MODE_MAP["w"]
+    assert txt
+    assert not apn
+
+    with pytest.raises(ValueError):
+        PGLargeObject.resolve_mode("abc")
+
+    await PGLargeObject.delete(db, [oid])
+
+
+@pytest.mark.asyncio
+async def test_lob_io_unsupported_checks(client: AsyncClient, db: AsyncSession):
+    """Test catching mode-specific unsupported operations"""
+    lob = PGLargeObject(db, 0, "wt")
+    await lob.open()
+    oid = lob.oid
+
+    with pytest.raises(PGLargeObjectUnsupportedOp):
         await lob.read()
 
-    wbuff = _write_buffer
-    wbuff_len = len(wbuff)
-    wrote = await lob.write(wbuff)
-    assert wrote == lob.pos == wbuff_len
+    wrote = await lob.write(WRITE_BUFFER)
+    assert wrote == lob.pos == len(WRITE_BUFFER_BIN)
     await lob.close()
     assert lob.length == lob.pos
 
-    with pytest.raises(UnsupportedOperation):
+    with pytest.raises(PGLargeObjectUnsupportedOp):
         await lob.read()
 
-    lob2 = await los.large_object_factory(db, lob.oid, "rt")
-    lob3 = await los.large_object_factory(db, lob.oid, "rb")
+    lob2 = PGLargeObject(db, oid, "rt")
+    await lob2.open()
+    lob3 = PGLargeObject(db, oid, "rb")
+    await lob3.open()
 
-    with pytest.raises(UnsupportedOperation):
+    with pytest.raises(PGLargeObjectUnsupportedOp):
         await lob2.write("asdf")
 
-    with pytest.raises(UnsupportedOperation):
+    with pytest.raises(PGLargeObjectUnsupportedOp):
         await lob2.truncate()
 
+    await PGLargeObject.delete(db, [oid])
+
+
+@pytest.mark.asyncio
+async def test_lob_io_re_read(client: AsyncClient, db: AsyncSession):
+    """Test read with position reset and re-read"""
+    oid = rbuff =None
+    async with PGLargeObject(db, 0, "wt") as lob:
+        oid = lob.oid
+        wrote = await lob.write(WRITE_BUFFER)
+        assert wrote == lob.pos == len(WRITE_BUFFER_BIN)
+
+    async with PGLargeObject(db, oid, "rt") as lob2:
+        rbuff = await lob2.read()
+        assert rbuff == WRITE_BUFFER
+        lob2.pos = 0
+        rbuff2 = await lob2.read()
+        assert rbuff2 == WRITE_BUFFER
+
+    await PGLargeObject.delete(db, [oid])
+
+
+@pytest.mark.asyncio
+async def test_lob_io_read_full_and_chunked(client: AsyncClient, db: AsyncSession):
+    """Test reading a full buffer and reading chunks"""
+    oid = rbuff =None
+    async with PGLargeObject(db, 0, "wt") as lob:
+        oid = lob.oid
+        wrote = await lob.write(WRITE_BUFFER)
+        assert wrote == lob.pos == len(WRITE_BUFFER_BIN)
+
+    lob2 = PGLargeObject(db, oid, "rt")
+    await lob2.open()
+    lob3 = PGLargeObject(db, oid, "rb")
+    await lob3.open()
+
     rbuff = await lob2.read()
-    assert rbuff == wbuff
+    assert rbuff == WRITE_BUFFER
+
     rbuff = await lob3.read()
-    assert rbuff == _write_buffer_bin
+    assert rbuff == WRITE_BUFFER_BIN
 
     await lob2.close()
     await lob3.close()
 
-    lob2 = await los.large_object_factory(db, lob.oid, "rb", chunk_size=100)
-    lob3 = await los.large_object_factory(db, lob.oid, "rt", chunk_size=100)
+    lob2 = PGLargeObject(db, oid, "rb", chunk_size=100)
+    await lob2.open()
+    lob3 = PGLargeObject(db, oid, "rt", chunk_size=100)
+    await lob3.open()
     rlist = []
     rlist = [x async for x in lob3.gread()]
     riter = len(rlist)
     rbuff = "".join(rlist)
     assert riter > 1
-    assert rbuff == wbuff
+    assert rbuff == WRITE_BUFFER
 
     rlist = []
     rlist = [x async for x in lob2.gread()]
     riter = len(rlist)
     rbuff = b"".join(rlist)
     assert riter > 1
-    assert rbuff == _write_buffer_bin
+    assert rbuff == WRITE_BUFFER_BIN
 
     await lob2.close()
     await lob3.close()
 
-    lob = await los.large_object_factory(db, lob.oid, "wb")
-    wbuff = _write_buffer_bin
-    wbuff_len = len(wbuff)
-    wrote = await lob.write(wbuff)
-    assert wrote == lob.pos == wbuff_len
-    await lob.close()
-    assert lob.length == lob.pos
+    await PGLargeObject.delete(db, [oid])
 
-    lob2 = await los.large_object_factory(db, lob.oid, "rt")
-    lob3 = await los.large_object_factory(db, lob.oid, "rb")
+
+@pytest.mark.asyncio
+async def test_lob_io_write_bin_read_txt(client: AsyncClient, db: AsyncSession):
+    """Test writing binary (encoded text) data and reading text"""
+    oid = None
+    async with PGLargeObject(db, 0, "wb") as lob:
+        oid = lob.oid
+        wbuff_len = len(WRITE_BUFFER_BIN)
+        wrote = await lob.write(WRITE_BUFFER_BIN)
+        assert wrote == lob.pos == wbuff_len
+
+    lob2 = PGLargeObject(db, oid, "rt")
+    await lob2.open()
+    lob3 = PGLargeObject(db, oid, "rb")
+    await lob3.open()
     rbufft = await lob2.read()
     rbuffb = await lob3.read()
     await lob2.close()
     await lob3.close()
-    assert rbufft == _write_buffer
-    assert rbuffb == _write_buffer_bin
+    assert rbufft == WRITE_BUFFER
+    assert rbuffb == WRITE_BUFFER_BIN
 
-    await lob.delete()
+    await PGLargeObject.delete(db, [oid])
+
+
+@pytest.mark.asyncio
+async def test_lob_io_txt_with_emoji(client: AsyncClient, db: AsyncSession):
+    """Test writing text mixed with emoji to the large object"""
+    _WRITE_BUFFER = WRITE_BUFFER + "✨ 🍰 ✨"
+    _WRITE_BUFFER_BIN = _WRITE_BUFFER.encode()
+    oid = None
+    async with PGLargeObject(db, 0, "rwt") as lob:
+        oid = lob.oid
+        wrote = await lob.write(_WRITE_BUFFER)
+        assert len(_WRITE_BUFFER) != len(_WRITE_BUFFER_BIN)
+        assert wrote == lob.pos == len(_WRITE_BUFFER_BIN)
+
+    assert lob.length == lob.pos
+
+    await PGLargeObject.delete(db, [oid])
