@@ -1,3 +1,5 @@
+import faker
+from io import BytesIO
 from io import UnsupportedOperation
 
 import pytest
@@ -7,22 +9,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ansible_events_ui.db.utils.lostream import *
 
 
-# So.. This may look like a key or something, but I swear that
-# is is just gibberish
-# What I needed here was just a reaonably sized buffer of data
-# that I can use to read and write in a single chunk. And also test
-# reading in multiple chunks.
-# I also wanted to test byte encoding with a reasonable sample of
-# characters.
-WRITE_BUFFER = """
-krhgqpivqebrpioughv;jlakrghao;rsubvnah;rouvshv;lj ukrLkUEH;SROUH4LFKHSRBVLIZ
-BDHT4LWTKGHSR POIHWAERLI QH34O IYW BElpi7wrgy qwlkuvq oq[ eth'ogq8yqhte'l u5
-[3p9hu 'N]0 UET'ROGY4HWOUGHAB DFSALPAE ;A;; RU HB4I7Y Ts:lbieHZV48Y75Y4;BO8G
-HY4 I7T GFIL IO;U UI;N 35Y EARTBUYV3  TEVOUKJTEA ERTGIU  ARGV LN; DGUREKRAWN
-M  ,. n rgeu e;edtslujhuj;/sdcxlljnwetlgsdijnsb;kln wrgk
-"""
+FAKER = faker.Faker()
+WRITE_BUFFER = FAKER.sentence(nb_words=200)
 WRITE_BUFFER_BIN = WRITE_BUFFER.encode()
 assert isinstance(WRITE_BUFFER_BIN, bytes)
+
+
+def _dict2buff(d: dict) -> bytes:
+    return (f"|".join(str(v) for v in d.values())).encode()
+
+
+def _profile_generator() -> bytes:
+    for _ in range(1000):
+        yield _dict2buff(FAKER.profile())
 
 
 @pytest.mark.asyncio
@@ -183,9 +182,11 @@ async def test_lob_io_read_full_and_chunked(client: AsyncClient, db: AsyncSessio
     await lob2.close()
     await lob3.close()
 
-    lob2 = PGLargeObject(db, oid, "rb", chunk_size=100)
+    _chunk_size = len(WRITE_BUFFER_BIN) // 5
+
+    lob2 = PGLargeObject(db, oid, "rb", chunk_size=_chunk_size)
     await lob2.open()
-    lob3 = PGLargeObject(db, oid, "rt", chunk_size=100)
+    lob3 = PGLargeObject(db, oid, "rt", chunk_size=_chunk_size)
     await lob3.open()
     rlist = []
     rlist = [x async for x in lob3.gread()]
@@ -246,3 +247,26 @@ async def test_lob_io_txt_with_emoji(client: AsyncClient, db: AsyncSession):
     assert lob.length == lob.pos
 
     await PGLargeObject.delete(db, [oid])
+
+
+@pytest.mark.asyncio
+async def test_lob_write_from_stream_read(
+    client: AsyncClient, db: AsyncSession
+):
+    """Test writing bytes to large object from chunked stream read."""
+    _stdout = BytesIO()
+    for chunk in _profile_generator():
+        _stdout.write(chunk)
+    _stdout_len = _stdout.tell()
+    _test_chunk_size = _stdout_len // 5
+    _stdout.seek(0)
+    _total_chunk_len = 0
+
+    async with PGLargeObject(
+        db, 0, "rwb", chunk_size=_test_chunk_size
+    ) as lob:
+        for chunk in iter(lambda: _stdout.read(_test_chunk_size), b""):
+            _total_chunk_len += len(chunk)
+            await lob.write(chunk)
+    assert _total_chunk_len == _stdout_len
+    assert lob.length == _stdout_len
